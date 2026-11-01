@@ -213,7 +213,8 @@ globalThis.fetch = async (url, options = {}) => {
     return fakeResponse({
       status: 307,
       headers: {
-        location: 'https://open.weixin.qq.com/connect/qrconnect?appid=wx622c70c4608a3b23&state=STATE1#wechat_redirect',
+        // appid 用占位符：真实值属于站点方，插件自己也不读它（只跟着 location 走）。
+        location: 'https://open.weixin.qq.com/connect/qrconnect?appid=wx0000000000000000&state=STATE1#wechat_redirect',
         'set-cookie-list': [
           'lc_wechat_oauth_state=STATE1; Path=/auth/oauth/wechat/callback',
           'lc_wechat_oauth_mode=website; Path=/auth/oauth/wechat/callback',
