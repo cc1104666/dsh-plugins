@@ -1,0 +1,11 @@
+# dsh-grok-online 的配置层（bundle layer）。
+#
+# 只写「站点地址」这类不会变的东西。别在这里写 providerId / relayPort ——
+# patch 里的 config 优先级高于 lib/store.js 的 DEFAULT_CONFIG，写死反而会盖掉
+# 运行期（面板）改的值。
+- insert:
+    - id: grok-online
+      name: 'dsh-grok-online'
+      config:
+        siteBase: 'https://grok.online'
+        apiPath: '/api/chat'

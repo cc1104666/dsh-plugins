@@ -1,0 +1,15 @@
+# dsh-lightvela 的配置层（bundle layer）。
+#
+# 这一行把插件挂进配置树；config 里的字段就是 lib/store.js 的 DEFAULT_CONFIG
+# 里可覆盖的那几个。插件自己也写一份运行期配置（dataDir/config.json），
+# 优先级：patch 里的 config < 运行期 config.json（面板写入）。
+#
+# 注意：不要在 patch 里写 providerId / gatewayBase 的具体值 —— 网关地址是登录后
+# 从实例里读出来的（config.yaml 的 model.base_url），写死在这儿会盖掉真实值。
+- insert:
+    - id: lightvela
+      name: 'dsh-lightvela'
+      config:
+        apiBase: 'https://api.lightvela.com'
+        siteBase: 'https://lightvela.com'
+        loginUrl: 'https://lightvela.com/auth/sign-in'

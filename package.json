@@ -1,0 +1,19 @@
+{
+  "name": "dsh-plugins",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH plugins that surface third-party chat services in the model picker.",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cc1104666/dsh-plugins.git"
+  },
+  "author": "cc1104666"
+}

@@ -1,0 +1,55 @@
+{
+  "name": "dsh-grok-online",
+  "version": "0.1.0",
+  "description": "把 grok.online 的免费对话额度接进 DSH 模型选择器：本机反代翻译成 OpenAI 兼容接口，每天 4 条 + 5 条奖励，不需要 key。",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "grok",
+    "grok-online",
+    "relay",
+    "provider"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cc1104666/dsh-plugins.git",
+    "directory": "packages/dsh-grok-online"
+  },
+  "author": "cc1104666",
+  "homepage": "https://github.com/cc1104666/dsh-plugins/tree/main/packages/dsh-grok-online#readme",
+  "bugs": {
+    "url": "https://github.com/cc1104666/dsh-plugins/issues"
+  }
+}

@@ -1,0 +1,187 @@
+# dsh-lightvela
+
+把 **LightVela（lightvela.com）** 套餐里的模型，接管进 DSH 的模型选择器。
+
+登录方式：微信扫码。之后的对话走 LightVela 自己的模型网关，
+花的是你套餐里的 **AI 积分**。
+
+---
+
+## 为什么这个插件不需要「反代」
+
+上一版（`dsh-vibex-vision`）必须在本机起一个 127.0.0.1 转发层，因为
+`llm.runninghub.cn` 只认某种特定请求头，而 DSH 只会带 `Authorization`。
+
+LightVela 不一样。它内部用的网关是：
+
+```
+https://token.lightvela.com/v1     # OpenAI 兼容，公网直达
+```
+
+这个地址是它自己的实例里 `~/.hermes/config.yaml` 的 `model.base_url`，
+实测**从公网拿 Bearer 就能调**，`/v1/models`、`/v1/chat/completions`、
+SSE 流式全部正常。所以插件只是把 `baseURL + key` 写进 DSH 的
+`llm-pi-ai` 配置，请求由 DSH 直连发出去，中间没有任何东西。
+
+> 面板上那个「无需反代」的标签就是这个意思 —— 不是省了事，是本来就不需要。
+
+---
+
+## 真麻烦的部分：key 从哪来
+
+LightVela 卖的**不是**模型 API，是「云上帮你跑一个 Hermes Agent 的实例」。
+模型额度由平台代付（套餐里的 AI 积分），它**没有任何对外发 API Key 的接口**：
+
+| 试过的路 | 结果 |
+|---|---|
+| `/v1/models`、`/v1/chat/completions` | 404，它压根不提供 |
+| 登录后的 JWT / cookie 直接打网关 | 401 invalid bearer token |
+| 复用实例的会话去调模型 | 对话走腾讯云 IM（sdkappid 1600167838），不是 REST |
+| 游客模式 `/auth/guest` | 401，官方自己都登不进 |
+
+箱子只有一个口子：实例沙箱里有一把 `CUSTOM_API_KEY`，那是 Hermes 调模型时
+真正用的钥匙。所以插件做的事是：
+
+```
+扫码登录（拿 lc_session）
+  → GET  /v1/instances                    找到在跑的那个实例
+  → POST /v1/instances/{id}/debug/exec    进沙箱读 ~/.hermes/.env
+  → 拿到 CUSTOM_API_KEY + config.yaml 里的 model.base_url
+  → 打一发探针确认能出字
+  → 写进 llm-pi-ai 的 providers.lightvela
+```
+
+`/debug/exec` 是 LightVela 自己的前端在用的调试通道（打开对话页就能看到它在
+跑 `SOUL.md` 相关的 shell），鉴权和网页登录态一致，不是什么后门。
+
+**注意**：钥匙跟着实例走。实例重建 / 换 Bot 之后要重新拉一次 —— 面板上
+「② 模型钥匙 → 重新拉取」就是干这个的。
+
+---
+
+## 它是怎么扫码的
+
+不是公众号带参二维码（那是 RunningHub 那套），这里是**微信开放平台网页应用
+授权**（`snsapi_login`）：
+
+```
+1. GET  api.lightvela.com/auth/oauth/wechat/start
+        → 307 到 open.weixin.qq.com，同时下发 4 个只用于回调路径的 cookie
+          （lc_wechat_oauth_state / _mode / _scope / _return_to）
+2. 请求那个 307 地址，页面 HTML 里带 connect/qrcode/<uuid>
+3. 二维码 = https://open.weixin.qq.com/connect/qrcode/<uuid>
+4. 长轮询 https://lp.open.weixin.qq.com/connect/l/qrconnect?uuid=<uuid>
+        wx_errcode = 408 超时（继续轮）| 405 已扫待确认 | 403 已取消 | 0 成功 + wx_code
+5. 拿 code + state 打 /auth/oauth/wechat/callback，**带上第 1 步那 4 个 cookie**
+        → 站点下发 lc_session
+```
+
+第 5 步必须带那 4 个 cookie：服务端把 `state` 存在 cookie 里做 CSRF 校验，
+只给 query 里的 `state` 匹配不上。
+
+整个过程在宿主端跑完，不弹浏览器、不用复制 cookie。
+
+---
+
+## 安装
+
+```bash
+# 1. 把包放进 profile 的 node_modules
+cp -r dsh-lightvela ~/.dsh/profiles/desktop/node_modules/
+
+# 2. 登记到 profile（dependencies + dsh.profile.bundles 各加一条）
+#    或者在 ~/.dsh/profiles/desktop/package.json 里手工加：
+#      "dependencies":       { "dsh-lightvela": "file:<本目录绝对路径>" }
+#      "dsh.profile.bundles": [ ..., "dsh-lightvela" ]
+
+# 3. 重启 DSH（宿主半区不热更）
+```
+
+重启后，聊天框下方会出现一个 **LightVela** 胶囊；插件页里也有一张同款卡片。
+
+---
+
+## 用起来
+
+1. 点「生成二维码」→ 微信扫 → 手机上点确认。**首次授权会自动建号**，直接扫就行。
+2. 登录成功后插件会自己找实例、把钥匙拉回来（面板 ② 会显示实例名）。
+3. 点 ③ 的「读清单」→「逐个探测」→「注册」。
+4. **刷新 DSH 页面**，模型选择器里就多出「LightVela」这一组。
+
+想在注册前先确认这条链路通不通，用 ④ 的「试一句」。
+
+---
+
+## 它到底给你哪些模型
+
+`/v1/models` 返回的是「这把 token 在当前分组里能调的名字」，实测只有四条：
+
+| id | 说明 | 实测 |
+|---|---|---|
+| `auto` | 网关自己挑，会落到 glm-5.3-flash 一类 | ✅ 可调 |
+| `deepseek-v4-pro-202606` | 真实型号 | ✅ 可调 |
+| `ep-hyasr3` | 自定义端点 | ❌ No available channel |
+| `llmgw-mock-chat` | 自检假模型 | ❌ 404，插件默认藏掉 |
+
+`auto` 是最省心的选项：网关按可用性和负载挑，不用你猜哪个能用。
+
+> 这批模型清单属于 LightVela 的套餐分组，跟你在它网站上付费档位有关。
+> 换档位后回面板点一次「读清单」就能看到新的。
+
+---
+
+## 排错
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 面板报「宿主端没有这条接口（HTTP 404/405）」 | 宿主还是旧代码。重启 DSH |
+| 扫码一直停在「等扫码」 | 二维码 5 分钟过期。点「取消」再生成一张 |
+| 扫码成功但 ② 显示「没钥匙」 | 实例没跑（`status` 不是 Running），或者这个 Bot 还没配模型 |
+| ② 报「这个实例用的是你自己的服务商」 | 你在 LightVela 里改成了 BYOB（自带 key）。那把 key 是你自己的，拿出去没意义，插件会如实拒绝 |
+| 聊天报 402 / `insufficient_funds` | 套餐积分用完了。这是上游账务，不是插件问题 |
+| 聊天报 401 `invalid bearer token` | 实例重建过，钥匙变了。回 ② 点「重新拉取」，再回 ③ 注册一次 |
+| 选择器里没有「LightVela」组 | ① 确认 ③ 显示「已注册 N 个」；② 刷新浏览器页面（不是重启 DSH） |
+| 模型选择器里选了模型但报「model not found」 | 那个模型在当前分组没开。回 ③ 点「逐个探测」，看哪个是「可调」 |
+
+---
+
+## 安全说明
+
+- 插件读的是**你自己账号、你自己实例**里的凭据，存在
+  `~/.dsh/plugin-data/dsh-lightvela/auth.json`（权限 0600），跟 DSH 其他凭据一样在本机。
+- 它不会把钥匙发到除 `token.lightvela.com` 以外的任何地方。
+- 退出登录（面板「退出」）会同时清掉登录态、钥匙和模型缓存。
+
+---
+
+## 接口
+
+宿主半区注册在 `/plugins/dsh-lightvela/` 下，共 12 条：
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/status` | 全量快照（登录态、钥匙、实例、模型、二维码状态） |
+| POST | `/auth/qr/start` | 申请二维码，返回 dataURL |
+| GET | `/auth/qr/status` | 只读二维码状态 |
+| POST | `/auth/qr/cancel` | 取消本轮扫码 |
+| POST | `/auth/bind` | 手贴 sessionToken（扫码失效时的兜底） |
+| POST | `/key/pull` | 重新进实例取钥匙，可指定 `{instanceId}` |
+| GET | `/instances` | 列出账号下的实例 |
+| POST | `/models/refresh` | 重读网关模型清单 |
+| POST | `/models/probe` | 逐个打一发，标可用性 |
+| POST | `/models/register` | 写进 `llm-pi-ai` 的 `providers.lightvela` |
+| POST | `/test` | 用当前钥匙打一发 `{model}` |
+| POST | `/logout` | 清凭据与缓存 |
+
+---
+
+## 开发
+
+```bash
+node scripts/smoke.mjs      # 28 项，假网络打满全链路
+```
+
+冒烟测试覆盖：store 两半凭据、模型清单归一化、微信协议解析（Set-Cookie /
+uuid / wx_errcode）、扫码全链路（假网络走完 start → poll → callback →
+自动取钥匙）、注册写进 llm-pi-ai 的断言（特别是 `baseURL` 必须是公网网关
+而不是 127.0.0.1）、浏览器半区的 factory 与插槽注册。

@@ -1,0 +1,57 @@
+{
+  "name": "dsh-grok3ai",
+  "version": "0.1.0",
+  "description": "把 www.grok3ai.org 的聊天能力接进 DSH 模型选择器。这个站自己没有模型 —— 它只是把公开的 HuggingFace Space 塞进 iframe，所以这里直连那些 Space（MiniMax-VL-01 / Llama-2-7B），翻译成 OpenAI 兼容接口。",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "grok3ai",
+    "huggingface",
+    "gradio",
+    "space",
+    "relay",
+    "provider"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cc1104666/dsh-plugins.git",
+    "directory": "packages/dsh-grok3ai"
+  },
+  "author": "cc1104666",
+  "homepage": "https://github.com/cc1104666/dsh-plugins/tree/main/packages/dsh-grok3ai#readme",
+  "bugs": {
+    "url": "https://github.com/cc1104666/dsh-plugins/issues"
+  }
+}

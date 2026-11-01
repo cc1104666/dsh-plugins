@@ -1,0 +1,12 @@
+# dsh-grok3ai 的配置层（bundle layer）。
+#
+# 这里只写「不该被面板改掉」的东西。Space 的地址和 fn 名字写在 lib/spaces.js 里
+# （它们是代码，不是配置 —— 换地址等于换解析规则）。
+#
+# 故意不写 providerId / relayPort：patch 里的 config 优先级高于 lib/store.js 的
+# DEFAULT_CONFIG，写死反而会盖掉运行期（面板）改的值。
+- insert:
+    - id: grok3ai
+      name: 'dsh-grok3ai'
+      config:
+        providerName: 'Grok3AI'

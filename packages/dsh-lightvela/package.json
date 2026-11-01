@@ -1,0 +1,54 @@
+{
+  "name": "dsh-lightvela",
+  "version": "0.1.0",
+  "description": "把 LightVela（lightvela.com）套餐里的模型接管进 DSH 模型选择器：微信扫码登录 → 从云实例里取模型凭据 → 写进 llm-pi-ai。网关本身 OpenAI 兼容，无需本机反代。",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "lightvela",
+    "llm",
+    "provider"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cc1104666/dsh-plugins.git",
+    "directory": "packages/dsh-lightvela"
+  },
+  "author": "cc1104666",
+  "homepage": "https://github.com/cc1104666/dsh-plugins/tree/main/packages/dsh-lightvela#readme",
+  "bugs": {
+    "url": "https://github.com/cc1104666/dsh-plugins/issues"
+  }
+}
