@@ -11,6 +11,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 
 export const DEFAULT_CONFIG = {
   /** 业务/鉴权接口。网页登录、实例列表、沙箱 exec 都在这下面。 */
@@ -43,6 +44,11 @@ export const DEFAULT_CONFIG = {
    * 改成空串 = 关闭。
    */
   referralCode: 'JAKDMLAGJR',
+  /**
+   * 多账号时本机转发器监听的首位端口。被占就顺延，最后才随机。
+   * 只监听 127.0.0.1 —— 它不是给外面用的，是给 DSH 自己用的。
+   */
+  relayPort: 43720,
   /** 留空用默认目录。 */
   dataDir: '',
 }
@@ -106,6 +112,97 @@ export function createStore(initialConfig = {}) {
   let runtimeConfig = readJSON(configPath, {})
   if (!isPlainObject(runtimeConfig)) runtimeConfig = {}
 
+  /* ---------------------------------------------------------------- 账号池
+   *
+   * auth.json 从 v1（单个账号平铺）升到 v2（账号数组 + activeId）。
+   * v1 读进来会自动迁移，老用户不用重新扫码。
+   *
+   * 一个「账号」= 一把 sessionToken + 一把从它实例里挖出来的模型钥匙。
+   * LightVela 的额度是按账号算的，所以「切换账号」等价于「换钥匙」。
+   */
+
+  const emptyAccount = () => ({
+    id: '',
+    /** 用户可改的备注名，空着就显示微信昵称。 */
+    label: '',
+    sessionToken: '',
+    user: null,
+    apiKey: '',
+    gatewayBase: '',
+    instanceId: '',
+    instanceName: '',
+    keyPulledAt: null,
+    source: '',
+    savedAt: null,
+    /** ok / exhausted（没额度）/ error（钥匙坏了、要重新登录）。 */
+    quotaStatus: 'ok',
+    quotaNote: '',
+    exhaustedAt: 0,
+    lastOkAt: 0,
+  })
+
+  /** 账号 id：优先用户 id，退化到 token 摘要。要稳定，重复扫码才能落到同一条。 */
+  const accountId = (user, sessionToken, apiKey) => {
+    const uid = user && typeof user.id === 'string' ? user.id.trim() : ''
+    if (uid !== '') return uid
+    const seed = String(sessionToken || apiKey || '')
+    if (seed === '') return ''
+    return `acc-${createHash('sha1').update(seed).digest('hex').slice(0, 10)}`
+  }
+
+  const normalizeAccount = (raw) => {
+    const base = emptyAccount()
+    if (!isPlainObject(raw)) return base
+    const merged = { ...base, ...raw }
+    merged.id = String(merged.id || accountId(merged.user, merged.sessionToken, merged.apiKey) || '')
+    merged.label = typeof merged.label === 'string' ? merged.label : ''
+    merged.sessionToken = typeof merged.sessionToken === 'string' ? merged.sessionToken : ''
+    merged.apiKey = typeof merged.apiKey === 'string' ? merged.apiKey : ''
+    merged.gatewayBase = typeof merged.gatewayBase === 'string' ? merged.gatewayBase : ''
+    merged.quotaNote = typeof merged.quotaNote === 'string' ? merged.quotaNote : ''
+    if (!['ok', 'exhausted', 'error'].includes(merged.quotaStatus)) merged.quotaStatus = 'ok'
+    for (const key of ['exhaustedAt', 'lastOkAt']) {
+      if (typeof merged[key] !== 'number' || !Number.isFinite(merged[key])) merged[key] = 0
+    }
+    return merged
+  }
+
+  const readPool = () => {
+    const value = readJSON(authPath, null)
+    if (!isPlainObject(value)) return { version: 2, activeId: '', accounts: [] }
+
+    // v1：{sessionToken, apiKey, user, ...} 平铺 —— 迁移成一个账号。
+    if (!Array.isArray(value.accounts)) {
+      const migrated = normalizeAccount(value)
+      return { version: 2, activeId: migrated.id, accounts: migrated.id === '' ? [] : [migrated] }
+    }
+
+    const accounts = value.accounts.map(normalizeAccount).filter((item) => item.id !== '')
+    const activeId = accounts.some((item) => item.id === value.activeId)
+      ? value.activeId
+      : accounts[0]
+        ? accounts[0].id
+        : ''
+    return { version: 2, activeId, accounts }
+  }
+
+  const writePool = (pool) => {
+    const accounts = (pool.accounts || []).filter((item) => item && item.id)
+    const activeId = accounts.some((item) => item.id === pool.activeId)
+      ? pool.activeId
+      : accounts[0]
+        ? accounts[0].id
+        : ''
+    writeJSON(authPath, { version: 2, activeId, accounts, savedAt: new Date().toISOString() }, 0o600)
+    return { version: 2, activeId, accounts }
+  }
+
+  const publish = (pool) => ({
+    version: 2,
+    activeId: pool.activeId,
+    accounts: pool.accounts,
+  })
+
   const store = {
     dir,
 
@@ -120,39 +217,149 @@ export function createStore(initialConfig = {}) {
       return store.config()
     },
 
-    /** 登录态 + 模型钥匙。两半分开存：换钥匙不该把登录态冲掉。 */
-    auth() {
-      const value = readJSON(authPath, null)
-      if (!isPlainObject(value)) return null
-      const hasSession = typeof value.sessionToken === 'string' && value.sessionToken !== ''
-      const hasKey = typeof value.apiKey === 'string' && value.apiKey !== ''
-      if (!hasSession && !hasKey) return null
-      return value
+    /* ------------------------------------------------------------ 账号池 */
+
+    /** 整个池子（只读快照）。 */
+    pool() {
+      return publish(readPool())
     },
 
+    /** 当前账号（扁平）。老代码全走这个，语义和单账号时代一致。 */
+    auth() {
+      const pool = readPool()
+      const hit = pool.accounts.find((item) => item.id === pool.activeId)
+      if (!hit) return null
+      if (hit.sessionToken === '' && hit.apiKey === '') return null
+      return hit
+    },
+
+    /**
+     * 转发器要用的候选顺序：当前账号优先，其次正常账号，最后才是标记没额度的。
+     * 全都没额度时也把 exhausted 的排进来 —— 宁可打一次 402，也别直接拒绝请求。
+     */
+    candidates() {
+      const pool = readPool()
+      const rank = (item) => {
+        // 没额度的永远垫底 —— 哪怕它是「当前账号」。当前账号没额度时，
+        // 转发器会直接把当前账号换成下一个能用的。
+        if (item.quotaStatus === 'exhausted') return 2
+        return item.id === pool.activeId ? 0 : 1
+      }
+      return pool.accounts
+        .filter((item) => item.apiKey !== '')
+        .slice()
+        .sort((a, b) => rank(a) - rank(b) || (b.lastOkAt || 0) - (a.lastOkAt || 0))
+    },
+
+    /** 扫码拿到新账号：同一个 user.id 就更新，不同就追加，并设为当前。 */
+    addAccount({ sessionToken, user, source }) {
+      const pool = readPool()
+      const id = accountId(user, sessionToken, '')
+      if (id === '') return null
+      const before = pool.accounts.find((item) => item.id === id) || emptyAccount()
+      const merged = normalizeAccount({
+        ...before,
+        id,
+        sessionToken: sessionToken || before.sessionToken,
+        user: user || before.user,
+        source: source || before.source,
+        savedAt: new Date().toISOString(),
+        // 重新登录过的账号，额度状态重新算 —— 用户可能刚充过钱。
+        quotaStatus: 'ok',
+        quotaNote: '',
+        exhaustedAt: 0,
+      })
+      pool.accounts = [...pool.accounts.filter((item) => item.id !== id), merged]
+      pool.activeId = id
+      writePool(pool)
+      return merged
+    },
+
+    /**
+     * 老接口。带 user 的调用当成「登录了一个账号」，其余当成「改当前账号」。
+     * 这样 index.js 里那些 patchAuth({apiKey: ...}) 不用改。
+     */
     patchAuth(patch) {
-      const current = store.auth() || {}
-      const next = { ...current, ...patch }
-      next.savedAt = new Date().toISOString()
-      writeJSON(
-        authPath,
-        {
-          sessionToken: next.sessionToken || '',
-          user: next.user || null,
-          /** 模型钥匙：从实例沙箱里拉回来的 CUSTOM_API_KEY。 */
-          apiKey: next.apiKey || '',
-          gatewayBase: next.gatewayBase || '',
-          /** 钥匙来自哪个实例。实例重建后 key 会变，留着便于判断该不该重拉。 */
-          instanceId: next.instanceId || '',
-          instanceName: next.instanceName || '',
-          keyPulledAt: next.keyPulledAt || null,
-          /** 登录态怎么来的：wechat-qr（扫码）/ manual（手贴）。 */
-          source: next.source || '',
-          savedAt: next.savedAt,
-        },
-        0o600,
-      )
+      if (!isPlainObject(patch)) return store.auth()
+      if (patch.user) return store.addAccount(patch)
+      const pool = readPool()
+      const hit = pool.accounts.find((item) => item.id === pool.activeId)
+      if (hit) return store.patchAccount(hit.id, patch)
+
+      // 池子里还没有账号，但手里先有一把钥匙（手贴 / 老数据）——
+      // 给它造一条记录，别让这把钥匙无处安放。
+      if (!patch.apiKey && !patch.sessionToken) return null
+      const id = accountId(null, patch.sessionToken, patch.apiKey)
+      if (id === '') return null
+      const created = normalizeAccount({ ...patch, id, savedAt: new Date().toISOString() })
+      writePool({ activeId: id, accounts: [...pool.accounts, created] })
+      return created
+    },
+
+    patchAccount(id, patch) {
+      const pool = readPool()
+      const index = pool.accounts.findIndex((item) => item.id === id)
+      if (index < 0) return null
+      const merged = normalizeAccount({ ...pool.accounts[index], ...patch, id })
+      pool.accounts[index] = merged
+      writePool(pool)
+      return merged
+    },
+
+    setActive(id) {
+      const pool = readPool()
+      if (!pool.accounts.some((item) => item.id === id)) return null
+      pool.activeId = id
+      writePool(pool)
       return store.auth()
+    },
+
+    removeAccount(id) {
+      const pool = readPool()
+      const next = pool.accounts.filter((item) => item.id !== id)
+      if (next.length === pool.accounts.length) return store.pool()
+      writePool({ accounts: next, activeId: pool.activeId === id ? '' : pool.activeId })
+      return store.pool()
+    },
+
+    /** 清掉「没额度」标记：用户充钱了、或者你只是想再给它一次机会。 */
+    clearQuota(id) {
+      const pool = readPool()
+      const targets = id ? pool.accounts.filter((item) => item.id === id) : pool.accounts
+      if (targets.length === 0) return store.pool()
+      for (const item of targets) {
+        item.quotaStatus = 'ok'
+        item.quotaNote = ''
+        item.exhaustedAt = 0
+      }
+      writePool(pool)
+      return store.pool()
+    },
+
+    /** 标记没额度 / 钥匙坏了。转发器撞到 402 或 401 时调。 */
+    markQuota(id, status, note) {
+      const pool = readPool()
+      const hit = pool.accounts.find((item) => item.id === id)
+      if (!hit) return null
+      hit.quotaStatus = status
+      hit.quotaNote = String(note || '').slice(0, 200)
+      if (status === 'exhausted') hit.exhaustedAt = Date.now()
+      writePool(pool)
+      return hit
+    },
+
+    touchOk(id) {
+      const pool = readPool()
+      const hit = pool.accounts.find((item) => item.id === id)
+      if (!hit) return null
+      hit.lastOkAt = Date.now()
+      if (hit.quotaStatus === 'exhausted') {
+        hit.quotaStatus = 'ok'
+        hit.quotaNote = ''
+        hit.exhaustedAt = 0
+      }
+      writePool(pool)
+      return hit
     },
 
     clearAuth() {

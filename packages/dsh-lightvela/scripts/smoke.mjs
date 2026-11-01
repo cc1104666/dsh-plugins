@@ -7,11 +7,12 @@
  *   1. store：配置读写、登录态与钥匙两半互不覆盖、模型缓存；
  *   2. models：mock 过滤、auto 排序、去重；
  *   3. lightvela.js 的纯函数：Set-Cookie 解析、uuid 提取、微信轮询响应解析；
- *   4. 宿主半区：13 条路由、扫码全链路（假网络）、邀请归因、取钥匙、注册 provider；
+ *   4. 宿主半区：14 条路由、扫码全链路（假网络）、邀请归因、多账号轮换、取钥匙、注册 provider；
  *   5. 浏览器半区：factory 能求值、apply 会注册 dock 与插件页插槽。
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import nodeHttp from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
@@ -185,6 +186,28 @@ globalThis.fetch = async (url, options = {}) => {
   const method = options.method || 'GET'
   calls.push({ url: target, method, body: options.body, headers: options.headers || {} })
 
+  // 0. 多账号轮换用的假网关：sk-key-a 没额度，sk-key-b 能用。
+  if (target.startsWith('https://fake-gw.test/')) {
+    const authorization = String((options.headers && options.headers.authorization) || '')
+    if (authorization.includes('sk-key-a')) {
+      return fakeResponse({
+        status: 402,
+        body: JSON.stringify({ error: { message: 'Insufficient credits', code: 'insufficient_quota' } }),
+      })
+    }
+    if (target.includes('/chat/completions')) {
+      return fakeResponse({
+        status: 200,
+        body: JSON.stringify({
+          id: 'chatcmpl-fake',
+          object: 'chat.completion',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'from-key-b' }, finish_reason: 'stop' }],
+        }),
+      })
+    }
+    return fakeResponse({ status: 200, body: JSON.stringify({ data: [{ id: 'auto', owned_by: 'fake' }] }) })
+  }
+
   // 1. 申请扫码
   if (target.includes('/auth/oauth/wechat/start')) {
     return fakeResponse({
@@ -341,8 +364,8 @@ await ok('导出 name / apply', () => {
   assert.equal(host.name, 'lightvela')
   assert.equal(typeof host.apply, 'function')
 })
-await ok('注册了 13 条路由，且都在插件前缀下', () => {
-  assert.equal(routes.size, 13, `实际 ${routes.size} 条：${[...routes.keys()].join(', ')}`)
+await ok('注册了 14 条路由，且都在插件前缀下', () => {
+  assert.equal(routes.size, 14, `实际 ${routes.size} 条：${[...routes.keys()].join(', ')}`)
   assert.ok([...routes.keys()].every((key) => key.startsWith('/plugins/dsh-lightvela/')))
 })
 
@@ -357,6 +380,35 @@ function fakeRes() {
       out.body = body
     },
   }
+}
+
+/** 直接打本机转发器：不能用 globalThis.fetch，那个已经被假网络顶掉了。 */
+function postRaw(port, path, payload) {
+  return new Promise((resolve, reject) => {
+    const body = Buffer.from(JSON.stringify(payload), 'utf8')
+    const request = nodeHttp.request(
+      {
+        host: '127.0.0.1',
+        port,
+        path,
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': body.length },
+      },
+      (response) => {
+        const chunks = []
+        response.on('data', (chunk) => chunks.push(chunk))
+        response.on('end', () =>
+          resolve({
+            status: response.statusCode,
+            headers: response.headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }),
+        )
+      },
+    )
+    request.on('error', reject)
+    request.end(body)
+  })
 }
 
 function call(routePath, payload) {
@@ -376,7 +428,10 @@ await ok('/status 未登录时如实报告', async () => {
   assert.equal(status, 200)
   assert.equal(json.authed, false)
   assert.equal(json.keyReady, false)
-  assert.equal(json.relay, false, '这个插件不该声称要反代')
+  // 转发器是异步起的，这一帧还没好；要保证的是字段在、形状对。
+  assert.equal(typeof json.relay, 'object', 'relay 应该是状态对象')
+  assert.equal(typeof json.relay.running, 'boolean')
+  assert.deepEqual(json.accounts, [], '没有账号时应该给空数组')
   assert.equal(json.modelPicker.providerId, 'lightvela')
 })
 
@@ -464,8 +519,9 @@ await ok('/models/register 写进 llm-pi-ai 的 providers.lightvela', async () =
   assert.equal(value.displayName, 'LightVela')
   assert.equal(value.api, 'openai-completions')
   assert.equal(value.apiKeyEnv, 'LIGHTVELA_API_KEY')
-  // 关键断言：baseURL 是公网网关，不是 127.0.0.1 反代
-  assert.equal(value.baseURL, 'https://token.lightvela.com/v1')
+  // 关键断言：baseURL 指向本机转发器 —— 只有经过它才能在 402 那一刻换账号。
+  assert.equal(value.baseURL, json.relay.baseURL, 'baseURL 应该指向转发器')
+  assert.match(value.baseURL, /^http:\/\/127\.0\.0\.1:\d+\/v1$/)
   assert.equal(value.models.length, 2)
 })
 
@@ -493,6 +549,83 @@ await ok('/logout 清掉凭据与缓存', async () => {
   assert.equal(json.authed, false)
   assert.equal(json.keyReady, false)
   assert.equal(createStore({ dataDir: sandbox }).auth(), null)
+})
+
+console.log('\n[4b] 多账号与额度耗尽自动切换')
+
+/** 造两个号：A 没额度（402），B 能用。网关都指向假网络里的 fake-gw.test。 */
+function seedTwoAccounts() {
+  const pool = createStore({ dataDir: sandbox })
+  pool.clearAuth()
+  pool.addAccount({ sessionToken: 'tk-a', user: { id: 'usr_a', name: '主号' }, source: 'manual' })
+  pool.patchAccount('usr_a', { apiKey: 'sk-key-a', gatewayBase: 'https://fake-gw.test/v1' })
+  pool.addAccount({ sessionToken: 'tk-b', user: { id: 'usr_b', name: '备用号' }, source: 'manual' })
+  pool.patchAccount('usr_b', { apiKey: 'sk-key-b', gatewayBase: 'https://fake-gw.test/v1' })
+  // 故意让「没额度」的那个当当前账号，逼转发器自己换
+  pool.setActive('usr_a')
+  return pool
+}
+
+await ok('两个账号都能存下来，且只有一个 active', async () => {
+  seedTwoAccounts()
+  const { json } = await call('status')
+  assert.equal(json.accounts.length, 2)
+  assert.equal(json.activeId, 'usr_a')
+  assert.equal(json.accounts.filter((item) => item.active).length, 1)
+  assert.equal(json.relay.running, true, `转发器没起来：${JSON.stringify(json.relay)}`)
+})
+
+await ok('转发器撞到 402 自动换下一个账号重试', async () => {
+  const { json } = await call('status')
+  const port = json.relay.port
+  assert.ok(port > 0)
+
+  const response = await postRaw(port, '/v1/chat/completions', {
+    model: 'auto',
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.equal(response.status, 200, `应该换号重试成功，实际 ${response.status}：${response.body}`)
+  assert.match(response.body, /from-key-b/, '响应该是备用号给的')
+  assert.equal(decodeURIComponent(String(response.headers['x-lightvela-account'] || '')), '备用号')
+
+  const after = await call('status')
+  const dead = after.json.accounts.find((item) => item.id === 'usr_a')
+  assert.equal(dead.quotaStatus, 'exhausted', '没额度的账号应该被标掉')
+  assert.equal(after.json.activeId, 'usr_b', '当前账号应该自动切走')
+})
+
+await ok('没额度的账号会被排到候选队尾', () => {
+  const pool = createStore({ dataDir: sandbox })
+  const order = pool.candidates().map((item) => item.id)
+  assert.deepEqual(order, ['usr_b', 'usr_a'], `候选顺序不对：${order.join(' -> ')}`)
+})
+
+await ok('/accounts 支持切换 / 改名 / 清额度 / 删除', async () => {
+  const { json: renamed } = await call('accounts', { action: 'label', id: 'usr_b', label: '小号' })
+  assert.equal(renamed.accounts.find((item) => item.id === 'usr_b').label, '小号')
+
+  const { json: cleared } = await call('accounts', { action: 'quota' })
+  assert.ok(cleared.accounts.every((item) => item.quotaStatus !== 'exhausted'), '清额度没生效')
+
+  const { json: switched } = await call('accounts', { action: 'switch', id: 'usr_a' })
+  assert.equal(switched.activeId, 'usr_a')
+
+  const { json: bad } = await call('accounts', { action: '不认识的' })
+  assert.equal(bad.ok, false)
+
+  const { json: removed } = await call('accounts', { action: 'remove', id: 'usr_b' })
+  assert.equal(removed.accounts.length, 1)
+  assert.equal(removed.activeId, 'usr_a', '删掉非当前账号不该动 active')
+})
+
+await ok('账号全没额度时，转发器仍会把最后一个错误如实回给 DSH', async () => {
+  const pool = createStore({ dataDir: sandbox })
+  pool.markQuota('usr_a', 'exhausted', '402')
+  const { json } = await call('status')
+  const port = json.relay.port
+  const response = await postRaw(port, '/v1/chat/completions', { model: 'auto', messages: [] })
+  assert.ok(response.status >= 400, `应该报错，实际 ${response.status}`)
+  assert.match(response.body, /已试过 1 个账号/)
 })
 
 console.log('\n[5] 浏览器半区')
@@ -706,6 +839,8 @@ const BASE_STATUS = {
   modelPicker: {},
   models: [],
   qr: { phase: 'idle' },
+  accounts: [],
+  relay: { running: true, port: 43700, baseURL: 'http://127.0.0.1:43700/v1' },
 }
 
 await ok('未登录时渲染出「用邀请链接注册」按钮', async () => {
@@ -734,4 +869,46 @@ await ok('没配邀请码时整块邀请区不出现', async () => {
   assert.ok(!html.includes('用邀请链接注册'), '关了邀请码不该还有按钮')
 })
 
+await ok('多账号时渲染出账号池与切换按钮', async () => {
+  const html = await renderPanelWith({
+    ...BASE_STATUS,
+    authed: true,
+    keyReady: true,
+    accounts: [
+      {
+        id: 'usr_a',
+        label: '主号',
+        name: '主号',
+        active: true,
+        keyReady: true,
+        authed: true,
+        instanceName: '小助手',
+        quotaStatus: 'ok',
+        quotaNote: '',
+      },
+      {
+        id: 'usr_b',
+        label: '备用号',
+        name: '备用号',
+        active: false,
+        keyReady: true,
+        authed: true,
+        instanceName: '小助手2',
+        quotaStatus: 'exhausted',
+        quotaNote: 'Insufficient credits（HTTP 402）',
+      },
+    ],
+    referral: { code: '', url: '', applied: '', check: null },
+  })
+  assert.ok(html.includes('账号池'), '没渲染账号池区块')
+  assert.ok(html.includes('主号') && html.includes('备用号'), '账号没列出来')
+  assert.ok(html.includes('当前'), '没标出当前账号')
+  assert.ok(html.includes('没额度'), '没标出没额度的账号')
+  assert.ok(html.includes('切到这个'), '没渲染切换按钮')
+  assert.ok(html.includes('自动切换'), '状态行没显示自动切换徽标')
+  assert.ok(html.includes('127.0.0.1:43700'), '没把转发器地址写出来')
+})
+
+// 转发器开着监听，Node 事件循环不会自己退出 —— 收个尾，别让 CI 挂住。
 console.log(`\n全部通过：${passed} 项\n`)
+process.exit(0)

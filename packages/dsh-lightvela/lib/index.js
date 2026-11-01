@@ -23,6 +23,7 @@
  */
 import { createStore } from './store.js'
 import { createWechatLogin } from './login.js'
+import { createRelay } from './relay.js'
 import { normalizeModels, toProviderModels } from './models.js'
 import {
   fetchSession,
@@ -95,6 +96,61 @@ export function apply(ctx, config) {
   let published = null
   /** 邀请码校验结果缓存：别让面板每次轮询都去打一次站点。 */
   let referralCheck = null
+  /** 账号池里最后一次真正写盘的 touchOk 时间（省得每个请求都写一次盘）。 */
+  let lastTouchOkAt = 0
+
+  const accountLabel = (account) =>
+    (account && (account.label || (account.user && (account.user.name || account.user.id)) || account.id)) || '未命名账号'
+
+  /**
+   * 本机转发器。DSH 的模型请求会打到它，它按「当前账号 → 其它正常账号 →
+   * 没额度的账号」的顺序挑钥匙；撞到 402 立刻换下一个重试。
+   *
+   * 单账号时它也照样跑 —— 一条代码路径，比「单账号直连 / 多账号转发」两套
+   * 逻辑少一半边界情况。
+   */
+  const relay = createRelay({
+    getConfig: () => store.config(),
+    getCandidates: () =>
+      store.candidates().map((account) => ({
+        id: account.id,
+        label: accountLabel(account),
+        apiKey: account.apiKey,
+        gatewayBase: account.gatewayBase || store.config().gatewayBase,
+      })),
+    log,
+    /** 某个账号被判死（402 没额度 / 401 钥匙失效）时记下来。 */
+    onQuota: (id, status, note) => {
+      // retry = 只是被限流，不标死，下一条还能用。否则会把频繁限流的账号永久踢掉。
+      if (status === 'retry') return
+      const saved = store.markQuota(id, status, note)
+      if (!saved) return
+      log(`账号「${accountLabel(saved)}」标记为 ${status}：${note}`)
+      // 当前账号被标死，顺手切到下一个能用的，面板上能立刻看到变化。
+      const pool = store.pool()
+      if (pool.activeId === id) {
+        const next = store.candidates().find((item) => item.id !== id && item.quotaStatus !== 'exhausted')
+        if (next) {
+          store.setActive(next.id)
+          log(`当前账号没额度，已切到「${accountLabel(next)}」`)
+        }
+      }
+    },
+    /** 转发器实际用上了某个账号：让它成为「当前账号」，并记一次活跃时间。 */
+    onActive: (id) => {
+      const pool = store.pool()
+      if (pool.activeId !== id) {
+        store.setActive(id)
+        lastTouchOkAt = Date.now()
+        log(`已切到账号「${id}」`)
+        return
+      }
+      if (Date.now() - lastTouchOkAt > 60 * 1000) {
+        lastTouchOkAt = Date.now()
+        store.touchOk(id)
+      }
+    },
+  })
 
   const hydrateCatalog = () => {
     if (catalog) return catalog
@@ -114,14 +170,18 @@ export function apply(ctx, config) {
     log,
     onAuthed: ({ sessionToken, user, source }) => {
       const saved = store.patchAuth({ sessionToken, user, source })
+      // 扫码的可能是「再加一个账号」，所以先看池子里现在有几个。
+      const total = store.pool().accounts.length
+      log(total > 1 ? `新增账号「${accountLabel(saved)}」，池子里共 ${total} 个` : `登录成功：${accountLabel(saved)}`)
       // 登录只是登录。取钥匙放在 afterLogin 里做，这样"登录成功但没钥匙"能被单独看见。
-      afterLogin().catch((error) => log(`登录后自动取钥匙失败：${fail(error)}`))
+      afterLogin(saved && saved.id).catch((error) => log(`登录后自动取钥匙失败：${fail(error)}`))
       return saved
     },
   })
 
   const snapshot = () => {
     const cfg = store.config()
+    const pool = store.pool()
     const auth = store.auth()
     const saved = hydrateCatalog()
     const qrView = login.view()
@@ -139,6 +199,33 @@ export function apply(ctx, config) {
         : { id: '', name: '' },
       gatewayBase: (auth && auth.gatewayBase) || cfg.gatewayBase,
       loginUrl: cfg.loginUrl,
+      /**
+       * 账号池。面板按这个渲染列表；exhausted 的账号会被转发器跳过。
+       * active 那一条就是 DSH 现在实际在用的钥匙。
+       */
+      activeId: pool.activeId,
+      accounts: pool.accounts.map((item) => ({
+        id: item.id,
+        label: item.label || '',
+        name: (item.user && (item.user.name || item.user.id)) || '',
+        active: item.id === pool.activeId,
+        keyReady: item.apiKey !== '',
+        authed: item.sessionToken !== '',
+        instanceName: item.instanceName || '',
+        gatewayBase: item.gatewayBase || '',
+        keyPulledAt: item.keyPulledAt || null,
+        quotaStatus: item.quotaStatus,
+        quotaNote: item.quotaNote || '',
+        exhaustedAt: item.exhaustedAt || 0,
+        lastOkAt: item.lastOkAt || 0,
+        source: item.source || '',
+      })),
+      /** 转发器状态：running=false 说明端口没起来，面板要提示退化成直连。 */
+      relay: {
+        running: relay.port > 0,
+        port: relay.port,
+        baseURL: relay.baseURL,
+      },
       /** 模型选择器那边的情况。 */
       modelPicker: {
         registered: Boolean(published),
@@ -162,17 +249,15 @@ export function apply(ctx, config) {
         applied: qrView.referral || '',
         check: referralCheck,
       },
-      /** 明确告诉面板：这次不需要本机反代。 */
-      relay: false,
     }
   }
 
-  const requireSession = () => {
-    const auth = store.auth()
+  const requireSession = (accountId) => {
+    const auth = accountId ? store.pool().accounts.find((item) => item.id === accountId) : store.auth()
     if (!auth || !auth.sessionToken) {
-      throw new Error('还没登录 LightVela。先在上面扫码。')
+      throw new Error(accountId ? '这个账号没有登录态，先扫码重新登录' : '还没登录 LightVela。先在上面扫码。')
     }
-    return auth.sessionToken
+    return auth
   }
 
   /** 挑实例：优先 Running 的，多个就取第一个。 */
@@ -196,7 +281,7 @@ export function apply(ctx, config) {
     const saved = hydrateCatalog()
     if (!force && saved && Date.now() - (saved.at || 0) < CATALOG_TTL) return saved
 
-    const gatewayBase = auth.gatewayBase || store.config().gatewayBase
+    const gatewayBase = relay.baseURL || auth.gatewayBase || store.config().gatewayBase
     const rows = await listGatewayModels(store.config(), gatewayBase, auth.apiKey)
     // 网关的 /v1/models 不带「能不能调」，探测结果只在本机存着。
     // 重新拉目录时把上次探测到的 usable/note 按 id 贴回去，否则每次刷新都把结论丢了。
@@ -232,7 +317,9 @@ export function apply(ctx, config) {
     }
 
     const cfg = store.config()
-    const baseURL = (auth.gatewayBase || cfg.gatewayBase).replace(/\/$/, '')
+    // 转发器起来了就指本机 —— 多账号切换必须经过它。起不来才退回直连
+    // （直连也能用，只是额度用尽时没法自动换账号）。
+    const baseURL = (relay.baseURL || auth.gatewayBase || cfg.gatewayBase).replace(/\/$/, '')
     // 探测过且明确打不通的模型不进选择器 —— 放进去只会让人选中后报错。
     const healthy = loaded.models.filter((item) => item.usable !== false)
     const models = toProviderModels(healthy.length > 0 ? healthy : loaded.models)
@@ -265,25 +352,39 @@ export function apply(ctx, config) {
     return published
   }
 
-  /** 登录成功后：顺手把实例和钥匙一起拉回来，少让用户点一次。 */
-  const afterLogin = async () => {
-    const sessionToken = requireSession()
-    const current = store.auth() || {}
-    const instance = await pickInstance(sessionToken, current.instanceId || '')
-    const key = await pullSandboxKey(store.config(), sessionToken, instance.instanceId)
+  /**
+   * 给某个账号拉钥匙：找实例 → 进沙箱读 CUSTOM_API_KEY → 落盘。
+   * 不传 accountId 就拉当前账号的。
+   */
+  const pullKeyFor = async (accountId, preferInstanceId) => {
+    const account = requireSession(accountId)
+    const cfg = store.config()
+    const instance = await pickInstance(account.sessionToken, preferInstanceId || account.instanceId || '')
+    const key = await pullSandboxKey(cfg, account.sessionToken, instance.instanceId)
     if (!key.ok) {
-      log(`登录成功，但没取到钥匙：${key.code} ${key.note}`)
-      return { instance, key }
+      log(`账号「${accountLabel(account)}」没取到钥匙：${key.code} ${key.note}`)
+      return { account, instance, key }
     }
-    store.patchAuth({
+    const saved = store.patchAccount(account.id, {
       apiKey: key.apiKey,
       gatewayBase: key.baseUrl,
       instanceId: instance.instanceId,
       instanceName: instance.name,
       keyPulledAt: new Date().toISOString(),
+      // 换了钥匙就重新给它机会 —— 原来标死的理由（额度/失效）可能已经不成立了。
+      quotaStatus: 'ok',
+      quotaNote: '',
+      exhaustedAt: 0,
     })
-    log(`已从实例「${instance.name}」取到模型钥匙（${key.apiKey.length} 字符）`)
-    return { instance, key }
+    log(`账号「${accountLabel(saved || account)}」取到模型钥匙（${key.apiKey.length} 字符，实例 ${instance.name}）`)
+    return { account: saved || account, instance, key }
+  }
+
+  /** 登录成功后：顺手把实例和钥匙一起拉回来，少让用户点一次。 */
+  const afterLogin = async (accountId) => {
+    const { account, instance, key } = await pullKeyFor(accountId)
+    if (!key.ok) return { instance, key }
+    return { account, instance, key }
   }
 
   const routes = [
@@ -349,8 +450,8 @@ export function apply(ctx, config) {
           if (!probe.ok) {
             return json(res, 200, { ...snapshot(), ok: false, error: `这个会话用不了：${probe.note}` })
           }
-          store.patchAuth({ sessionToken: raw, user: probe.user, source: 'manual' })
-          await afterLogin().catch((error) => log(`手贴登录后取钥匙失败：${fail(error)}`))
+          const saved = store.patchAuth({ sessionToken: raw, user: probe.user, source: 'manual' })
+          await afterLogin(saved && saved.id).catch((error) => log(`手贴登录后取钥匙失败：${fail(error)}`))
           return json(res, 200, { ...snapshot(), ok: true })
         } catch (error) {
           return json(res, 500, { ...snapshot(), ok: false, error: fail(error) })
@@ -358,30 +459,23 @@ export function apply(ctx, config) {
       },
     },
     {
-      /** 重新拉钥匙（实例重建、钥匙过期时用）。 */
+      /** 重新拉钥匙（实例重建、钥匙过期时用）。可指定 accountId 拉某个账号的。 */
       path: '/key/pull',
       handler: async (req, res) => {
         try {
-          const sessionToken = requireSession()
-          let prefer = store.config().instanceId || ''
+          let accountId = ''
+          let prefer = ''
           try {
             const body = await readJsonBody(req, MAX_BODY)
-            if (body && typeof body.instanceId === 'string' && body.instanceId !== '') prefer = body.instanceId
+            if (body && typeof body.instanceId === 'string') prefer = body.instanceId
+            if (body && typeof body.accountId === 'string') accountId = body.accountId
           } catch {
             /* 没 body 也正常 */
           }
-          const instance = await pickInstance(sessionToken, prefer)
-          const key = await pullSandboxKey(store.config(), sessionToken, instance.instanceId)
+          const { instance, key } = await pullKeyFor(accountId || undefined, prefer)
           if (!key.ok) {
             return json(res, 200, { ...snapshot(), ok: false, error: key.note, keyCode: key.code })
           }
-          store.patchAuth({
-            apiKey: key.apiKey,
-            gatewayBase: key.baseUrl,
-            instanceId: instance.instanceId,
-            instanceName: instance.name,
-            keyPulledAt: new Date().toISOString(),
-          })
           catalog = null
           return json(res, 200, { ...snapshot(), ok: true, instance })
         } catch (error) {
@@ -394,11 +488,66 @@ export function apply(ctx, config) {
       path: '/instances',
       handler: async (req, res) => {
         try {
-          const sessionToken = requireSession()
-          const instances = await listInstances(store.config(), sessionToken)
+          let accountId = ''
+          try {
+            const body = await readJsonBody(req, MAX_BODY)
+            if (body && typeof body.accountId === 'string') accountId = body.accountId
+          } catch {
+            /* ignore */
+          }
+          const account = requireSession(accountId || undefined)
+          const instances = await listInstances(store.config(), account.sessionToken)
           return json(res, 200, { ...snapshot(), ok: true, instances })
         } catch (error) {
           return json(res, 200, { ...snapshot(), ok: false, error: fail(error) })
+        }
+      },
+    },
+    {
+      /**
+       * 账号池操作。多账号是这套插件的核心，所以这些都是一等公民路由：
+       *   switch  切当前账号（转发器下一发就用它）
+       *   label   改备注名（多个微信号分不清时很有用）
+       *   remove  删掉某个账号
+       *   quota   清掉「没额度」标记（充值后 / 想重试一次）
+       */
+      path: '/accounts',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req, MAX_BODY)
+          const action = String(body.action || '')
+          const id = typeof body.id === 'string' ? body.id : ''
+
+          if (action === 'switch') {
+            if (!id) return json(res, 400, { ...snapshot(), ok: false, error: '要给 id' })
+            if (!store.setActive(id)) return json(res, 200, { ...snapshot(), ok: false, error: '没有这个账号' })
+            log(`手动切到账号「${id}」`)
+            return json(res, 200, { ...snapshot(), ok: true })
+          }
+
+          if (action === 'label') {
+            if (!id) return json(res, 400, { ...snapshot(), ok: false, error: '要给 id' })
+            const saved = store.patchAccount(id, { label: String(body.label || '').slice(0, 40) })
+            if (!saved) return json(res, 200, { ...snapshot(), ok: false, error: '没有这个账号' })
+            return json(res, 200, { ...snapshot(), ok: true })
+          }
+
+          if (action === 'remove') {
+            if (!id) return json(res, 400, { ...snapshot(), ok: false, error: '要给 id' })
+            store.removeAccount(id)
+            log(`删掉账号「${id}」`)
+            return json(res, 200, { ...snapshot(), ok: true })
+          }
+
+          if (action === 'quota') {
+            store.clearQuota(id || undefined)
+            log(id ? `清掉账号「${id}」的没额度标记` : '清掉全部账号的没额度标记')
+            return json(res, 200, { ...snapshot(), ok: true })
+          }
+
+          return json(res, 400, { ...snapshot(), ok: false, error: `不认识的 action：${action || '(空)'}` })
+        } catch (error) {
+          return json(res, 500, { ...snapshot(), ok: false, error: fail(error) })
         }
       },
     },
@@ -421,7 +570,8 @@ export function apply(ctx, config) {
           const auth = store.auth()
           if (!auth || !auth.apiKey) throw new Error('还没有模型钥匙')
           const loaded = await refreshCatalog({})
-          const gatewayBase = (auth.gatewayBase || store.config().gatewayBase).replace(/\/$/, '')
+          // 探测也走转发器：某个账号没额度时它会自动换下一个，探测结果才是「这套账号池能不能用」。
+          const gatewayBase = (relay.baseURL || auth.gatewayBase || store.config().gatewayBase).replace(/\/$/, '')
           const models = []
           for (const item of loaded.models) {
             const result = await probeChat(store.config(), gatewayBase, auth.apiKey, item.id)
@@ -462,7 +612,7 @@ export function apply(ctx, config) {
           const body = await readJsonBody(req, MAX_BODY)
           const auth = store.auth()
           if (!auth || !auth.apiKey) throw new Error('还没有模型钥匙')
-          const gatewayBase = (auth.gatewayBase || store.config().gatewayBase).replace(/\/$/, '')
+          const gatewayBase = (relay.baseURL || auth.gatewayBase || store.config().gatewayBase).replace(/\/$/, '')
           const model = String(body.model || 'auto')
           const result = await probeChat(store.config(), gatewayBase, auth.apiKey, model)
           const text =
@@ -530,9 +680,20 @@ export function apply(ctx, config) {
    * 为什么要重写：llm-pi-ai 的 providers 是宿主配置，插件重装 / profile 重建后
    * 会丢。重写一次几乎零成本，能让"重装插件后模型还在选择器里"成立。
    */
-  ctx.inject(['settings', 'credentials'], (seamCtx) => {
+  ctx.inject(['settings', 'credentials'], async (seamCtx) => {
     settingsSeam = (seamCtx && seamCtx.settings) || null
     credentialsSeam = (seamCtx && seamCtx.credentials) || null
+
+    /**
+     * 先起转发器，再注册 provider —— 顺序不能反：provider 的 baseURL 要指转发器
+     * 的端口，端口只有起来之后才知道。
+     */
+    try {
+      await relay.start(store.config().relayPort)
+    } catch (error) {
+      log(`转发器起不来（${fail(error)}），退回直连网关：这样还能用，但额度用尽时不会自动换账号`)
+    }
+
     const auth = store.auth()
     if (!auth || !auth.apiKey) {
       log('还没有模型钥匙，等面板里完成「扫码 → 取钥匙」后再注册')

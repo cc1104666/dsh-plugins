@@ -268,6 +268,8 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
         const [testText, setTestText] = React.useState('')
         const [testModel, setTestModel] = React.useState('auto')
         const [testResult, setTestResult] = React.useState(null)
+        const [renamingId, setRenamingId] = React.useState('')
+        const [renameText, setRenameText] = React.useState('')
 
         const qr = (status && status.qr) || { phase: 'idle' }
         const authed = Boolean(status && status.authed)
@@ -275,6 +277,10 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
         const models = (status && status.models) || []
         const picker = (status && status.modelPicker) || {}
         const referral = (status && status.referral) || { code: '', url: '', applied: '', check: null }
+        const accounts = (status && status.accounts) || []
+        const relayInfo = (status && status.relay) || { running: false, baseURL: '', port: 0 }
+        const exhaustedCount = accounts.filter((item) => item.quotaStatus === 'exhausted').length
+        const usableCount = accounts.filter((item) => item.keyReady && item.quotaStatus !== 'exhausted').length
         // 首帧 status 还是 null：统一走 view，避免 `null.instance` 把插件页整块打崩。
         const view = status || {}
 
@@ -344,9 +350,34 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
           setBusy('logout')
           await api('/logout', {})
           setBusy('')
-          setNotice('已退出，模型选择器里的 LightVela 组会在下次重启 DSH 后消失')
+          setNotice('已退出全部账号，模型选择器里的 LightVela 组会在下次重启 DSH 后消失')
           setStatus(null)
           await refresh()
+        }
+
+        /** 账号池操作：切换 / 改名 / 删除 / 清额度。 */
+        const accountAction = async (action, payload, done) => {
+          setBusy(`acc:${action}:${(payload && payload.id) || ''}`)
+          setError('')
+          setNotice('')
+          const result = await api('/accounts', { action, ...(payload || {}) })
+          setBusy('')
+          if (result && result.ok === false && result.error) setError(result.error)
+          else if (done) setNotice(done)
+          await refresh()
+          return result
+        }
+
+        const pullKeyFor = async (id) => {
+          setBusy(`key:${id}`)
+          setError('')
+          setNotice('')
+          const result = await api('/key/pull', { accountId: id })
+          setBusy('')
+          if (result && result.ok === false && result.error) setError(result.error)
+          else setNotice('这个账号的钥匙已更新')
+          await refresh()
+          return result
         }
 
         const runTest = async () => {
@@ -409,9 +440,19 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
               borderBottom: `1px solid ${p.border}`,
             },
           },
-          h('span', null, authed ? `账号 ${(view.account && (view.account.name || view.account.id)) || '已登录'}` : '未登录'),
+          h(
+            'span',
+            null,
+            authed
+              ? `账号 ${(view.account && (view.account.name || view.account.id)) || '已登录'}` +
+                  (accounts.length > 1 ? `（共 ${accounts.length} 个）` : '')
+              : '未登录',
+          ),
           h(Badge, { p, tone: authed ? 'ok' : 'warn' }, authed ? '登录态 OK' : '要扫码'),
           h(Badge, { p, tone: keyReady ? 'ok' : 'warn' }, keyReady ? '模型钥匙 OK' : '没钥匙'),
+          accounts.length > 1
+            ? h(Badge, { p, tone: relayInfo.running ? 'ok' : 'warn' }, relayInfo.running ? `自动切换 · ${usableCount} 可用` : '多账号未启用切换')
+            : null,
           picker.registered ? h(Badge, { p, tone: 'ok' }, `已注册 ${picker.count} 个`) : null,
           referral.applied ? h(Badge, { p, tone: 'ok' }, `已带邀请 ${referral.applied}`) : null,
         )
@@ -466,13 +507,14 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
               '二维码是宿主自己在本地向 LightVela 申请的（微信开放平台网页授权），你在手机上点确认后，' +
               '宿主自己把登录态领回来 —— 不用开浏览器，也不用复制 cookie。' +
               '首次授权会自动建号，所以你直接扫就行。' +
-              (referral.code ? `扫码时会自动带上邀请码 ${referral.code}，新账号按邀请归因。` : ''),
+              (referral.code ? `扫码时会自动带上邀请码 ${referral.code}，新账号按邀请归因。` : '') +
+              '再扫一个不同的微信号，就是往账号池里加第二个账号（同一个微信重复扫只会刷新它自己）。',
             right: authed
               ? h(
                   'div',
                   { style: { display: 'flex', gap: 6 } },
-                  h(Button, { p, tone: 'ghost', onClick: startQr, disabled: busy === 'qr' }, '重新登录'),
-                  h(Button, { p, tone: 'ghost', onClick: logout, disabled: busy === 'logout' }, '退出'),
+                  h(Button, { p, tone: 'ghost', onClick: startQr, disabled: busy === 'qr' }, '加一个账号'),
+                  h(Button, { p, tone: 'ghost', onClick: logout, disabled: busy === 'logout' }, '退出全部'),
                 )
               : null,
           },
@@ -526,7 +568,7 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
                 h(
                   Button,
                   { p, tone: 'primary', onClick: startQr, disabled: busy === 'qr' },
-                  busy === 'qr' ? '申请中…' : authed ? '再扫一次' : '生成二维码',
+                  busy === 'qr' ? '申请中…' : authed ? '再扫一个号' : '生成二维码',
                 ),
                 h(
                   Button,
@@ -555,11 +597,172 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
           inviteBlock,
         )
 
+        /**
+         * 账号池。
+         *
+         * 这块是整个多账号功能的主界面：
+         *   · 当前账号（转发器正在用的那把钥匙）高亮；
+         *   · 「没额度」的账号灰色 + 徽标，转发器会跳过它；
+         *   · 每行都能单独切 / 重拉钥匙 / 改名 / 删。
+         *
+         * 自动切换发生在转发器里，这里只负责让人看得见、改得动。
+         */
+        const accountRow = (item) => {
+          const label = item.label || item.name || item.id
+          const dead = item.quotaStatus === 'exhausted'
+          const broken = item.quotaStatus === 'error'
+          const tone = item.active ? 'ok' : dead || broken ? 'error' : item.keyReady ? 'ok' : 'warn'
+          const statusText = item.active
+            ? '当前'
+            : dead
+              ? '没额度'
+              : broken
+                ? '钥匙失效'
+                : item.keyReady
+                  ? '备用'
+                  : '缺钥匙'
+          return h(
+            'div',
+            {
+              key: item.id,
+              style: {
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                padding: '7px 9px',
+                marginBottom: 5,
+                borderRadius: 8,
+                background: p.soft,
+                border: `1px solid ${item.active ? p.accent : 'transparent'}`,
+                opacity: dead ? 0.62 : 1,
+              },
+            },
+            h(
+              'div',
+              { style: { flex: '1 1 auto', minWidth: 0 } },
+              h(
+                'div',
+                { style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: p.text, fontWeight: 600 } },
+                label,
+                h(Badge, { p, tone }, statusText),
+              ),
+              h(
+                'div',
+                { style: { fontSize: 10.5, color: p.muted, lineHeight: 1.6, wordBreak: 'break-all' } },
+                `钥匙${item.keyReady ? '已拉' : '未拉'}`,
+                item.instanceName ? ` · 实例 ${item.instanceName}` : '',
+                dead && item.quotaNote ? ` · ${item.quotaNote}` : '',
+                !dead && broken && item.quotaNote ? ` · ${item.quotaNote}` : '',
+              ),
+              renamingId === item.id
+                ? h(
+                    'div',
+                    { style: { display: 'flex', gap: 6, marginTop: 6, alignItems: 'center' } },
+                    h(TextInput, {
+                      p,
+                      value: renameText,
+                      onChange: setRenameText,
+                      placeholder: '给这个号起个名，比如「主号」「备用」',
+                    }),
+                    h(
+                      Button,
+                      {
+                        p,
+                        onClick: async () => {
+                          await accountAction('label', { id: item.id, label: renameText }, '备注名已更新')
+                          setRenamingId('')
+                        },
+                      },
+                      '保存',
+                    ),
+                  )
+                : null,
+            ),
+            h(
+              'div',
+              { style: { display: 'flex', gap: 5, flexWrap: 'wrap', justifyContent: 'flex-end', flex: '0 0 auto' } },
+              item.active
+                ? null
+                : h(
+                    Button,
+                    {
+                      p,
+                      tone: 'ghost',
+                      onClick: () => accountAction('switch', { id: item.id }, `已切到「${label}」`),
+                      disabled: !item.keyReady || dead,
+                    },
+                    '切到这个',
+                  ),
+              h(
+                Button,
+                { p, tone: 'ghost', onClick: () => pullKeyFor(item.id), disabled: !item.authed },
+                '重拉钥匙',
+              ),
+              renamingId === item.id
+                ? null
+                : h(
+                    Button,
+                    {
+                      p,
+                      tone: 'ghost',
+                      onClick: () => {
+                        setRenamingId(item.id)
+                        setRenameText(item.label || item.name || '')
+                      },
+                    },
+                    '改名',
+                  ),
+              h(
+                Button,
+                {
+                  p,
+                  tone: 'ghost',
+                  style: { color: p.danger, borderColor: p.danger },
+                  onClick: () => accountAction('remove', { id: item.id }, `已删掉「${label}」`),
+                },
+                '删',
+              ),
+            ),
+          )
+        }
+
+        const accountBlock = h(
+          Section,
+          {
+            p,
+            title: '② 账号池 · 额度用尽自动切',
+            hint:
+              (accounts.length > 1
+                ? `现在有 ${accounts.length} 个账号，其中 ${usableCount} 个还能用` +
+                  (exhaustedCount > 0 ? `，${exhaustedCount} 个已判定没额度` : '') +
+                  '。转发器按「当前 → 备用 → 没额度」的顺序挑，撞到 402 立刻换下一个重试，你感觉不到中断。'
+                : '再扫一个不同的微信号就能加第二个账号。只有一个账号时，额度用尽就只能等重置或充值。') +
+              (relayInfo.running
+                ? `模型选择器指向本机 http://127.0.0.1:${relayInfo.port}/v1，切换就发生在这一层。`
+                : '（转发器没起来，现在是直连网关 —— 能正常用，但不会自动换账号。）'),
+            right: h(
+              'div',
+              { style: { display: 'flex', gap: 6 } },
+              h(Button, { p, tone: 'ghost', onClick: startQr, disabled: busy === 'qr' }, '添加账号'),
+              exhaustedCount > 0
+                ? h(
+                    Button,
+                    { p, tone: 'ghost', onClick: () => accountAction('quota', {}, '已清掉全部「没额度」标记') },
+                    '清额度标记',
+                  )
+                : null,
+            ),
+          },
+          accounts.length === 0
+            ? h('div', { style: { fontSize: 11.5, color: p.muted } }, '还没有账号。先在 ① 里扫一个。')
+            : h('div', null, accounts.map(accountRow)),
+        )
+
         const keyBlock = h(
           Section,
           {
             p,
-            title: '② 模型钥匙',
+            title: '③ 模型钥匙',
             hint:
               'LightVela 的模型额度是平台代付的，它没有任何「对外发 API Key」的接口 —— 钥匙只存在于你那个云实例的 ' +
               '~/.hermes/.env 里（CUSTOM_API_KEY）。所以这一步是：用登录态进到实例沙箱读一次。' +
@@ -619,10 +822,13 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
           Section,
           {
             p,
-            title: '③ 模型放进 DSH 选择器',
+            title: '④ 模型放进 DSH 选择器',
             hint:
-              'LightVela 的网关本身就是 OpenAI 兼容的，公网直连可达 —— 所以这一步**不需要本机反代**，' +
-              '插件只是把 baseURL + 钥匙写进 DSH 的 llm-pi-ai 配置。写完刷新页面，模型选择器里就多出 ' +
+              'LightVela 的网关本身就是 OpenAI 兼容的，所以插件只把 baseURL + 钥匙写进 DSH 的 llm-pi-ai 配置。' +
+              (relayInfo.running
+                ? `baseURL 指向本机的转发器（http://127.0.0.1:${relayInfo.port}/v1）—— 它不改协议，只负责在多账号之间挑一个能用的。`
+                : '现在写的是直连网关的地址：能用，但额度用尽时不会自动换账号。') +
+              '写完刷新页面，模型选择器里就多出 ' +
               `「${picker.providerName || 'LightVela'}」这一组。`,
             right: h(
               'div',
@@ -646,7 +852,7 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
 
         const testBlock = h(
           Section,
-          { p, title: '④ 试一句', hint: '直接拿钥匙打一发，不经过 DSH，用来判断"是模型不行"还是"是配置没生效"。' },
+          { p, title: '⑤ 试一句', hint: '直接拿钥匙打一发，不经过 DSH，用来判断"是模型不行"还是"是配置没生效"。' },
           h(
             'div',
             { style: { display: 'flex', gap: 8, alignItems: 'center' } },
@@ -671,6 +877,7 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
           error ? h(Notice, { p, tone: 'error' }, error) : null,
           notice ? h(Notice, { p, tone: 'ok' }, notice) : null,
           loginBlock,
+          accountBlock,
           keyBlock,
           modelBlock,
           testBlock,
@@ -686,7 +893,9 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
               },
             },
             '说明：这里取的是你账号自己实例里的凭据，消耗的是你自己的套餐积分。',
-            '额度用尽时网关会返回 402，那不是插件的问题。',
+            accounts.length > 1
+              ? ' 额度用尽时网关返回 402，转发器会把这条请求换到下一个账号重试一次。'
+              : ' 额度用尽时网关会返回 402，那不是插件的问题。',
           ),
         )
 
@@ -729,7 +938,7 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
               'div',
               { style: { fontSize: 13, fontWeight: 700 } },
               'LightVela 模型接管',
-              h(Badge, { p, tone: 'ok' }, '无需反代'),
+              h(Badge, { p, tone: 'ok' }, relayInfo.running ? '本机转发 · 自动切号' : '直连网关'),
             ),
             embedded
               ? null

@@ -1,7 +1,7 @@
 {
   "name": "dsh-lightvela",
-  "version": "0.1.0",
-  "description": "把 LightVela（lightvela.com）套餐里的模型接管进 DSH 模型选择器：微信扫码登录 → 从云实例里取模型凭据 → 写进 llm-pi-ai。网关本身 OpenAI 兼容，无需本机反代。",
+  "version": "0.2.0",
+  "description": "把 LightVela（lightvela.com）套餐里的模型接管进 DSH 模型选择器：微信扫码登录（可多账号）→ 从云实例里取模型凭据 → 经本机透传转发器写进 llm-pi-ai。某个账号积分用尽时自动换下一个。",
   "type": "module",
   "main": "lib/index.js",
   "license": "MIT",
