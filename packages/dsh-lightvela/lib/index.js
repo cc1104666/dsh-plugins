@@ -30,6 +30,7 @@ import {
   pullSandboxKey,
   listGatewayModels,
   probeChat,
+  checkReferralCode,
 } from './lightvela.js'
 
 export const name = 'lightvela'
@@ -92,6 +93,8 @@ export function apply(ctx, config) {
   let catalog = null
   /** 上次注册进 llm-pi-ai 的结果，面板据此显示状态。 */
   let published = null
+  /** 邀请码校验结果缓存：别让面板每次轮询都去打一次站点。 */
+  let referralCheck = null
 
   const hydrateCatalog = () => {
     if (catalog) return catalog
@@ -121,6 +124,7 @@ export function apply(ctx, config) {
     const cfg = store.config()
     const auth = store.auth()
     const saved = hydrateCatalog()
+    const qrView = login.view()
     return {
       ok: true,
       authed: Boolean(auth && auth.sessionToken),
@@ -147,7 +151,17 @@ export function apply(ctx, config) {
         providerName: cfg.providerName,
       },
       models: saved ? saved.models : [],
-      qr: login.view(),
+      qr: qrView,
+      /**
+       * 邀请归因。code/url 来自配置，applied 是这一轮扫码实际挂上去的码。
+       * 面板拿它渲染「还没账号？用邀请链接注册」那颗按钮。
+       */
+      referral: {
+        code: cfg.referralCode || '',
+        url: cfg.referralCode ? `${cfg.siteBase}/?ref=${encodeURIComponent(cfg.referralCode)}` : '',
+        applied: qrView.referral || '',
+        check: referralCheck,
+      },
       /** 明确告诉面板：这次不需要本机反代。 */
       relay: false,
     }
@@ -276,6 +290,33 @@ export function apply(ctx, config) {
     {
       path: '/status',
       handler: async (req, res) => json(res, 200, snapshot()),
+    },
+    {
+      /**
+       * 邀请码体检：面板上那颗「用邀请链接注册」的按钮点开前先问一次，
+       * 免得邀请活动已经结束、用户却还被送去一个不返利的页面。
+       * 结果缓存 10 分钟，面板轮询不会把站点打穿。
+       */
+      path: '/referral',
+      handler: async (req, res) => {
+        const cfg = store.config()
+        const code = String(cfg.referralCode || '').trim()
+        if (code === '') {
+          return json(res, 200, { ok: true, code: '', url: '', check: null })
+        }
+        const stale = !referralCheck || referralCheck.at === undefined || Date.now() - referralCheck.at > CATALOG_TTL
+        if (stale) {
+          const result = await checkReferralCode(cfg, code)
+          referralCheck = { ...result, at: Date.now() }
+          log(`邀请码 ${code}：${result.ok ? `有效（${result.campaign || '未命名活动'}）` : result.note}`)
+        }
+        return json(res, 200, {
+          ok: true,
+          code,
+          url: `${cfg.siteBase}/?ref=${encodeURIComponent(code)}`,
+          check: referralCheck,
+        })
+      },
     },
     {
       /** 申请二维码。返回 dataURL，面板直接画出来。 */

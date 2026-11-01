@@ -7,7 +7,7 @@
  *   1. store：配置读写、登录态与钥匙两半互不覆盖、模型缓存；
  *   2. models：mock 过滤、auto 排序、去重；
  *   3. lightvela.js 的纯函数：Set-Cookie 解析、uuid 提取、微信轮询响应解析；
- *   4. 宿主半区：12 条路由、扫码全链路（假网络）、取钥匙、注册 provider；
+ *   4. 宿主半区：13 条路由、扫码全链路（假网络）、邀请归因、取钥匙、注册 provider；
  *   5. 浏览器半区：factory 能求值、apply 会注册 dock 与插件页插槽。
  */
 import assert from 'node:assert/strict'
@@ -183,7 +183,7 @@ let qrScanned = false
 globalThis.fetch = async (url, options = {}) => {
   const target = String(url)
   const method = options.method || 'GET'
-  calls.push({ url: target, method, body: options.body })
+  calls.push({ url: target, method, body: options.body, headers: options.headers || {} })
 
   // 1. 申请扫码
   if (target.includes('/auth/oauth/wechat/start')) {
@@ -261,6 +261,28 @@ globalThis.fetch = async (url, options = {}) => {
     ].join('\n')
     return fakeResponse({ status: 200, body: JSON.stringify({ code: 'OK', data: { status: 'SUCCESS', exit_code: 0, output: out } }) })
   }
+  // 8.5 邀请归因：校验邀请码 + 种 lc_referral_context
+  if (target.includes('/v1/referrals/codes/')) {
+    return fakeResponse({
+      status: 200,
+      body: JSON.stringify({
+        success: true,
+        data: {
+          Code: 'JAKDMLAGJR',
+          CampaignID: 'camp-smoke',
+          CampaignName: '好友邀请奖励',
+          StartsAt: '2026-09-15T16:00:00Z',
+          EndsAt: '2099-12-31T15:59:59Z',
+        },
+      }),
+    })
+  }
+  if (target.endsWith('/auth/referral/prepare')) {
+    return fakeResponse({
+      status: 204,
+      headers: { 'set-cookie-list': ['lc_referral_context=JAKDMLAGJR; Path=/auth; Max-Age=1800; HttpOnly'] },
+    })
+  }
   // 9. 网关模型清单
   if (target.endsWith('/v1/models')) {
     return fakeResponse({
@@ -319,8 +341,8 @@ await ok('导出 name / apply', () => {
   assert.equal(host.name, 'lightvela')
   assert.equal(typeof host.apply, 'function')
 })
-await ok('注册了 12 条路由，且都在插件前缀下', () => {
-  assert.equal(routes.size, 12, `实际 ${routes.size} 条：${[...routes.keys()].join(', ')}`)
+await ok('注册了 13 条路由，且都在插件前缀下', () => {
+  assert.equal(routes.size, 13, `实际 ${routes.size} 条：${[...routes.keys()].join(', ')}`)
   assert.ok([...routes.keys()].every((key) => key.startsWith('/plugins/dsh-lightvela/')))
 })
 
@@ -386,6 +408,23 @@ await ok('扫码全链路：申请 → 轮询 → 换会话 → 自动取钥匙'
   assert.equal(ready.json.keyReady, true, '登录后应自动把钥匙取回来')
   assert.equal(ready.json.instance.name, '小助手')
   assert.equal(ready.json.gatewayBase, 'https://token.lightvela.com/v1')
+})
+
+await ok('微信回调带上了邀请归因 cookie', () => {
+  const callback = calls.find((c) => c.url.includes('/auth/oauth/wechat/callback'))
+  assert.ok(callback, '应该调用过回调')
+  const sent = String((callback.headers && callback.headers.cookie) || '')
+  assert.match(sent, /lc_referral_context=JAKDMLAGJR/, '回调没带邀请 cookie，归因会丢')
+  assert.match(sent, /lc_wechat_oauth_state=STATE1/, '原有的 oauth cookie 不能被覆盖掉')
+})
+
+await ok('/referral 校验邀请码并给出邀请链接', async () => {
+  const { json } = await call('referral')
+  assert.equal(json.ok, true)
+  assert.equal(json.code, 'JAKDMLAGJR')
+  assert.equal(json.url, 'https://lightvela.com/?ref=JAKDMLAGJR')
+  assert.equal(json.check.ok, true)
+  assert.equal(json.check.campaign, '好友邀请奖励')
 })
 
 await ok('钥匙确实来自实例沙箱的 .env，不是别处', () => {
@@ -581,6 +620,118 @@ await ok('插件页卡片能在首帧渲染（status 还是 null 时不能崩）
     const html = render(card.component())
     assert.ok(html.includes('LightVela') || html.includes('Vela'), '卡片渲染出来是空的')
   })
+})
+
+/** 面板拿到真实 status 时的渲染。status 一非 null，邀请归因那段代码才会被求值。 */
+function renderPanelWith(status) {
+  let factory = null
+  const components = []
+  globalThis.window = {
+    __ModuleLoader__: {
+      load: ({ factory: fn }) => {
+        factory = fn
+      },
+    },
+    matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+    localStorage: { getItem: () => null, setItem() {} },
+  }
+  globalThis.document = { documentElement: { dataset: {}, className: '', style: {} } }
+  globalThis.MutationObserver = class {
+    observe() {}
+    disconnect() {}
+  }
+  globalThis.fetch = async () => ({ json: async () => ({ ok: true }) })
+
+  const render = (node, depth = 0) => {
+    if (node === null || node === undefined || node === false || node === true) return ''
+    if (typeof node === 'string' || typeof node === 'number') return String(node)
+    // children 传数组时会嵌成 `[a, b, [c, d]]`，不解开就会把整段静默丢掉。
+    if (Array.isArray(node)) return node.map((child) => render(child, depth)).join('')
+    if (!node || typeof node !== 'object') return ''
+    const { type, props } = node
+    if (typeof type === 'function') return render(type(props || {}), depth + 1)
+    const children = props && props.children
+    const list = Array.isArray(children) ? children : children === undefined ? [] : [children]
+    return list.map((child) => render(child, depth + 1)).join('')
+  }
+
+  const clientPath = pathToFileURL(path.join(ROOT, 'lib/client.js')).href
+  return import(`${clientPath}?v=panel-${Math.random()}`).then(() => {
+    let statusGiven = false
+    const mod = factory((id) => {
+      if (id !== 'react') throw new Error(`没准备这个模块：${id}`)
+      return {
+        createElement: (type, props, ...children) => ({
+          type,
+          props: { ...(props || {}), children: children.length <= 1 ? children[0] : children },
+        }),
+        useState: (initial) => {
+          // 面板里第一次 `useState(null)` 就是 status（前面只有 useTheme 的布尔）。
+          if (initial === null && !statusGiven) {
+            statusGiven = true
+            return [status, () => {}]
+          }
+          return [typeof initial === 'function' ? initial() : initial, () => {}]
+        },
+        useEffect: () => {},
+        useCallback: (fn) => fn,
+        useRef: (v) => ({ current: v }),
+        useMemo: (fn) => fn(),
+      }
+    })
+    mod.apply({
+      slots: {
+        inject(name, fn) {
+          fn()
+        },
+        register(meta, component) {
+          components.push({ name: meta.name, component })
+          return meta
+        },
+      },
+    })
+    const card = components.find((item) => item.name === 'plugins.bundle.config')
+    assert.ok(card && typeof card.component === 'function', '没拿到插件页卡片组件')
+    return render(card.component())
+  })
+}
+
+const BASE_STATUS = {
+  ok: true,
+  authed: false,
+  keyReady: false,
+  account: null,
+  instance: { id: '', name: '' },
+  gatewayBase: 'https://token.lightvela.com/v1',
+  modelPicker: {},
+  models: [],
+  qr: { phase: 'idle' },
+}
+
+await ok('未登录时渲染出「用邀请链接注册」按钮', async () => {
+  const html = await renderPanelWith({
+    ...BASE_STATUS,
+    referral: { code: 'JAKDMLAGJR', url: 'https://lightvela.com/?ref=JAKDMLAGJR', applied: '', check: null },
+  })
+  assert.ok(html.includes('用邀请链接注册'), '没渲染注册按钮')
+  assert.ok(html.includes('JAKDMLAGJR'), '没显示邀请码')
+  assert.ok(html.includes('复制链接'), '没渲染复制按钮')
+})
+
+await ok('已登录时把入口改成「邀请好友」，并标出已带归因', async () => {
+  const html = await renderPanelWith({
+    ...BASE_STATUS,
+    authed: true,
+    account: { id: 'usr_1', name: '微信用户' },
+    referral: { code: 'JAKDMLAGJR', url: 'https://lightvela.com/?ref=JAKDMLAGJR', applied: 'JAKDMLAGJR', check: null },
+  })
+  assert.ok(html.includes('邀请好友'), '已登录时没换成「邀请好友」')
+  assert.ok(html.includes('已带邀请'), '没标出这次登录已带归因')
+})
+
+await ok('没配邀请码时整块邀请区不出现', async () => {
+  const html = await renderPanelWith({ ...BASE_STATUS, referral: { code: '', url: '', applied: '', check: null } })
+  assert.ok(!html.includes('用邀请链接注册'), '关了邀请码不该还有按钮')
 })
 
 console.log(`\n全部通过：${passed} 项\n`)

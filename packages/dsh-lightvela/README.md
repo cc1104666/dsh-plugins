@@ -112,6 +112,37 @@ cp -r dsh-lightvela ~/.dsh/profiles/desktop/node_modules/
 
 ---
 
+## 邀请归因（拉新返积分）
+
+LightVela 是邀请制返利：新账号在**微信授权回调那一刻**若带着 `lc_referral_context`
+cookie，就记到邀请人名下。站点前端做的事只有两步：
+
+```
+GET  /v1/referrals/codes/{CODE}   校验这个码还在活动期内
+POST /auth/referral/prepare       种 lc_referral_context（Path=/auth，30 分钟）
+```
+
+关键在于这两步**不依赖浏览器** —— 归因只看回调那一发请求带没带 cookie。而回调路径
+`/auth/oauth/wechat/callback` 正好落在 `Path=/auth` 里，所以插件自己就能种：
+
+- 扫码流程在**回调前**重新种一次 cookie 再发回调，所以经由插件扫码建号的新用户，
+  自动算成邀请人的；
+- 面板①底部多一颗「用邀请链接注册 / 邀请好友」按钮，点开就是
+  `https://lightvela.com/?ref=<CODE>`，顺带能一键复制链接发人。
+
+配置项在 `lib/store.js` 的 `DEFAULT_CONFIG.referralCode`，也可以在
+`~/.dsh/plugin-data/dsh-lightvela/config.json` 里覆盖（运行期配置优先级更高）：
+
+```json
+{ "referralCode": "JAKDMLAGJR" }
+```
+
+改成空串 `""` 就彻底关掉 —— 归因不挂、按钮不显示，回归裸登录。
+
+> 归因失败不会阻断登录：老用户本来就不需要归因，别为了拉新把老用户挡在门外。
+
+---
+
 ## 它到底给你哪些模型
 
 `/v1/models` 返回的是「这把 token 在当前分组里能调的名字」，实测只有四条：
@@ -156,11 +187,12 @@ cp -r dsh-lightvela ~/.dsh/profiles/desktop/node_modules/
 
 ## 接口
 
-宿主半区注册在 `/plugins/dsh-lightvela/` 下，共 12 条：
+宿主半区注册在 `/plugins/dsh-lightvela/` 下，共 13 条：
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| GET | `/status` | 全量快照（登录态、钥匙、实例、模型、二维码状态） |
+| GET | `/status` | 全量快照（登录态、钥匙、实例、模型、二维码状态、邀请码） |
+| GET | `/referral` | 校验邀请码 + 给出邀请链接（结果缓存 10 分钟） |
 | POST | `/auth/qr/start` | 申请二维码，返回 dataURL |
 | GET | `/auth/qr/status` | 只读二维码状态 |
 | POST | `/auth/qr/cancel` | 取消本轮扫码 |

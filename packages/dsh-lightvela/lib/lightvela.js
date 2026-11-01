@@ -88,7 +88,7 @@ export function cookieHeader(jar) {
     .join('; ')
 }
 
-function mergeCookies(jar, fresh) {
+export function mergeCookies(jar, fresh) {
   const map = new Map()
   const add = (c) => {
     if (c && c.name) map.set(c.name, c.value)
@@ -214,6 +214,93 @@ export async function finishWechatScan(config, ticket, code) {
     sessionToken: session.value,
     cookies: merged,
     location: response.headers.get('location') || '',
+  }
+}
+
+/* ------------------------------------------------------------------ 邀请归因
+ *
+ * 站点前端的「邀请链接」其实只做两件事（从它的 login chunk 里读出来的）：
+ *
+ *   GET  /v1/referrals/codes/{CODE}   看看这个码还在不在活动期内
+ *   POST /auth/referral/prepare       种一个 lc_referral_context cookie
+ *                                     （Path=/auth，Max-Age=1800，HttpOnly）
+ *
+ * 之后微信授权回调建号时，服务端读这个 cookie 把新账号记到邀请人名下。
+ * 也就是说：**归因只看回调那一发请求带没带 cookie，和浏览器无关**。
+ *
+ * 所以插件完全可以自己种 —— 回调路径 /auth/oauth/wechat/callback 正好落在
+ * Path=/auth 里，只要在回调前把 cookie 并进 ticket.cookies 就行。
+ */
+
+/** 校验邀请码（顺带拿到活动名和截止时间，面板上能说清楚）。 */
+export async function checkReferralCode(config, code) {
+  const id = String(code || '').trim().toUpperCase()
+  if (id === '') return { ok: false, status: 0, note: '没有配置邀请码', code: '' }
+
+  let response
+  try {
+    response = await fetch(`${config.apiBase}/v1/referrals/codes/${encodeURIComponent(id)}`, {
+      headers: {
+        'user-agent': config.userAgent,
+        accept: 'application/json',
+        origin: config.siteBase,
+        referer: `${config.siteBase}/`,
+      },
+    })
+  } catch (error) {
+    return { ok: false, status: 0, note: `连不上 ${config.apiBase}：${String((error && error.message) || error)}`, code: id }
+  }
+
+  if (!response.ok) {
+    return { ok: false, status: response.status, note: `邀请码 ${id} 不被认可（HTTP ${response.status}）`, code: id }
+  }
+
+  const payload = await response.json().catch(() => null)
+  const data = (payload && payload.data) || null
+  if (!data) return { ok: false, status: response.status, note: `邀请码 ${id} 响应格式不对`, code: id }
+
+  const endsAt = data.EndsAt || ''
+  const expired = endsAt ? Date.parse(endsAt) < Date.now() : false
+  return {
+    ok: !expired,
+    status: response.status,
+    code: data.Code || id,
+    campaign: data.CampaignName || '',
+    campaignId: data.CampaignID || '',
+    inviter: data.InviterName || '',
+    startsAt: data.StartsAt || '',
+    endsAt,
+    note: expired ? `邀请活动已于 ${String(endsAt).slice(0, 10)} 结束` : '',
+  }
+}
+
+/**
+ * 种下归因 cookie。返回的那条 cookie 要并进 ticket.cookies，
+ * 跟着微信回调一起发出去才生效。
+ */
+export async function prepareReferral(config, code) {
+  const id = String(code || '').trim().toUpperCase()
+  if (id === '') return { ok: false, cookies: [], note: '没有配置邀请码' }
+
+  const response = await fetch(`${config.apiBase}/auth/referral/prepare`, {
+    method: 'POST',
+    headers: {
+      'user-agent': config.userAgent,
+      accept: 'application/json',
+      'content-type': 'application/json',
+      origin: config.siteBase,
+      referer: `${config.siteBase}/`,
+    },
+    body: JSON.stringify({ code: id }),
+  })
+
+  const cookies = readSetCookies(response)
+  return {
+    ok: response.ok,
+    status: response.status,
+    code: id,
+    cookies,
+    note: response.ok ? '' : `种邀请 cookie 失败（HTTP ${response.status}）`,
   }
 }
 

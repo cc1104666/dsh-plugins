@@ -21,6 +21,8 @@ import {
   pollWechatScan,
   finishWechatScan,
   fetchSession,
+  prepareReferral,
+  mergeCookies,
   SCAN_STATE,
 } from './lightvela.js'
 
@@ -45,6 +47,8 @@ export function createWechatLogin({ getConfig, log, onAuthed }) {
     startedAt: 0,
     expiresAt: 0,
     account: null,
+    /** 这一轮登录实际挂上的邀请码（没配就是空串）。 */
+    referral: '',
   }
 
   let ticket = null
@@ -62,6 +66,7 @@ export function createWechatLogin({ getConfig, log, onAuthed }) {
     expiresAt: state.expiresAt || null,
     secondsLeft: state.expiresAt ? Math.max(0, Math.round((state.expiresAt - Date.now()) / 1000)) : 0,
     account: state.account,
+    referral: state.referral,
   })
 
   const stopPolling = () => {
@@ -86,6 +91,7 @@ export function createWechatLogin({ getConfig, log, onAuthed }) {
     state.startedAt = 0
     state.expiresAt = 0
     state.account = null
+    state.referral = ''
     ticket = null
   }
 
@@ -106,10 +112,41 @@ export function createWechatLogin({ getConfig, log, onAuthed }) {
     }
   }
 
+  /**
+   * 把邀请归因挂到这次登录上。
+   *
+   * 站点是在**微信回调那一发请求**上读 `lc_referral_context` cookie 决定归因的，
+   * 而这条 cookie 只活 30 分钟、且 Path 限定在 /auth。二维码本身有效期 5 分钟，
+   * 理论上申请时就种也够，但用户可能拖着不扫 —— 所以在真正回调前再种一次，
+   * 保证它一定新鲜。
+   *
+   * 失败不阻断登录：老用户本来就不需要归因，别为了拉新把老用户挡在门外。
+   */
+  const attachReferral = async (cfg) => {
+    const code = String(cfg.referralCode || '').trim()
+    if (code === '' || !ticket) return
+    try {
+      const prepared = await prepareReferral(cfg, code)
+      if (!prepared.ok || prepared.cookies.length === 0) {
+        log(`邀请归因没挂上（${prepared.note || 'no cookie'}），继续登录`)
+        return
+      }
+      const before = ticket.cookies
+      ticket.cookies = mergeCookies(before, prepared.cookies)
+      state.referral = prepared.code
+      log(`本次登录已带邀请归因：${prepared.code}`)
+    } catch (error) {
+      log(`邀请归因请求出错，继续登录：${String((error && error.message) || error)}`)
+    }
+  }
+
   /** 拿到 code 之后：换会话 → 验一次 → 落盘。 */
   const accept = async (code, mine) => {
     const cfg = getConfig()
     state.note = '扫码成功，正在换取登录态…'
+    if (session !== mine) return
+
+    await attachReferral(cfg)
     if (session !== mine) return
 
     let result

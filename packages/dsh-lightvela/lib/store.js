@@ -32,6 +32,17 @@ export const DEFAULT_CONFIG = {
   providerId: 'lightvela',
   /** 注册进选择器的显示名。 */
   providerName: 'LightVela',
+  /**
+   * 邀请码。留空 = 不带归因，纯裸登录。
+   *
+   * 站点是「邀请返利」制：新账号在微信授权回调那一刻若带着 lc_referral_context
+   * cookie，就记到邀请人名下。插件在回调前会自己种这个 cookie，所以填上这里，
+   * 经由插件扫码建号的新用户就会算成你的邀请。
+   *
+   * 想换成自己的码（或想彻底关掉），改 config.json 里的这个字段即可；
+   * 改成空串 = 关闭。
+   */
+  referralCode: 'JAKDMLAGJR',
   /** 留空用默认目录。 */
   dataDir: '',
 }

@@ -274,6 +274,7 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
         const keyReady = Boolean(status && status.keyReady)
         const models = (status && status.models) || []
         const picker = (status && status.modelPicker) || {}
+        const referral = (status && status.referral) || { code: '', url: '', applied: '', check: null }
         // 首帧 status 还是 null：统一走 view，避免 `null.instance` 把插件页整块打崩。
         const view = status || {}
 
@@ -356,6 +357,41 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
           setTestResult(result)
         }
 
+        /** 打开邀请注册页。先问一次宿主邀请码还活着没，别把人送去过期活动。 */
+        const openInvite = async () => {
+          let url = referral.url
+          if (url === '') {
+            setError('插件没配邀请码（config.json 的 referralCode 为空）')
+            return
+          }
+          setBusy('invite')
+          const info = await api('/referral')
+          setBusy('')
+          if (info && info.ok && info.url) url = info.url
+          if (info && info.check && info.check.ok === false && info.check.note) {
+            setNotice(`${info.check.note} —— 链接还是给你打开了，但这个码可能不返利`)
+          }
+          try {
+            window.open(url, '_blank', 'noopener,noreferrer')
+          } catch (openError) {
+            setError(`打不开浏览器：${String((openError && openError.message) || openError)}`)
+          }
+        }
+
+        const copyInvite = async () => {
+          const text = referral.url || referral.code
+          if (!text) {
+            setError('插件没配邀请码')
+            return
+          }
+          try {
+            await navigator.clipboard.writeText(text)
+            setNotice('邀请链接已复制，发到群里就行')
+          } catch {
+            setNotice(`复制失败，手动拿走：${text}`)
+          }
+        }
+
         // ------------------------------------------------------------ 各区块
 
         const statusLine = h(
@@ -377,7 +413,49 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
           h(Badge, { p, tone: authed ? 'ok' : 'warn' }, authed ? '登录态 OK' : '要扫码'),
           h(Badge, { p, tone: keyReady ? 'ok' : 'warn' }, keyReady ? '模型钥匙 OK' : '没钥匙'),
           picker.registered ? h(Badge, { p, tone: 'ok' }, `已注册 ${picker.count} 个`) : null,
+          referral.applied ? h(Badge, { p, tone: 'ok' }, `已带邀请 ${referral.applied}`) : null,
         )
+
+        /**
+         * 邀请注册入口。
+         *
+         * 两条路都留着，因为它们解决的不是同一件事：
+         *   · 扫码登录那条已经自动带归因了 —— 新用户直接扫也能算邀请；
+         *   · 这颗按钮是给人「正在用插件、顺手想注册」的场景，点开就是邀请页，
+         *     归因走站点自己的 cookie，最稳。
+         */
+        const inviteBlock = referral.code
+          ? h(
+              'div',
+              {
+                style: {
+                  marginTop: 12,
+                  paddingTop: 10,
+                  borderTop: `1px dashed ${p.border}`,
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  alignItems: 'center',
+                  gap: 8,
+                },
+              },
+              h(
+                'div',
+                { style: { flex: '1 1 200px', minWidth: 0, fontSize: 11.5, color: p.muted, lineHeight: 1.6 } },
+                authed ? '想拉朋友一起用？把邀请页丢给他就行。' : '还没有 LightVela 账号？点右边直接用邀请链接注册，微信扫码即建号。',
+                h(
+                  'div',
+                  { style: { marginTop: 2, fontFamily: 'ui-monospace, monospace', fontSize: 10.5, color: p.muted } },
+                  `邀请码 ${referral.code}`,
+                ),
+              ),
+              h(
+                Button,
+                { p, tone: authed ? 'ghost' : 'primary', onClick: openInvite, disabled: busy === 'invite' },
+                busy === 'invite' ? '打开中…' : authed ? '邀请好友' : '用邀请链接注册',
+              ),
+              h(Button, { p, tone: 'ghost', onClick: copyInvite }, '复制链接'),
+            )
+          : null
 
         const loginBlock = h(
           Section,
@@ -387,7 +465,8 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
             hint:
               '二维码是宿主自己在本地向 LightVela 申请的（微信开放平台网页授权），你在手机上点确认后，' +
               '宿主自己把登录态领回来 —— 不用开浏览器，也不用复制 cookie。' +
-              '首次授权会自动建号，所以你直接扫就行。',
+              '首次授权会自动建号，所以你直接扫就行。' +
+              (referral.code ? `扫码时会自动带上邀请码 ${referral.code}，新账号按邀请归因。` : ''),
             right: authed
               ? h(
                   'div',
@@ -473,6 +552,7 @@ if (!MODULE_LOADER || typeof MODULE_LOADER.load !== 'function') {
                 ),
               )
             : null,
+          inviteBlock,
         )
 
         const keyBlock = h(
