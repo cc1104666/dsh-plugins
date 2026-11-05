@@ -1,0 +1,13 @@
+# dsh-ima 的配置层（bundle layer）。
+#
+# 这一行把插件挂进配置树；config 里的字段就是 lib/store.js 的 DEFAULT_CONFIG
+# 里可覆盖的那几个。插件自己也写一份运行期配置（dataDir/config.json），
+# 优先级：patch 里的 config < 运行期 config.json（面板写入）。
+#
+# 注意：不要在这里写 relayPort 之外的东西 —— 登录态全部落在
+# ~/.dsh/plugin-data/dsh-ima/auth.json，写死在这儿会盖掉真实值。
+- insert:
+    - id: ima
+      name: 'dsh-ima'
+      config:
+        siteBase: 'https://ima.qq.com'

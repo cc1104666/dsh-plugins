@@ -1,0 +1,55 @@
+{
+  "name": "dsh-ima",
+  "version": "0.1.0",
+  "description": "把 ima.qq.com（腾讯 IMA 知识管家）网页版的对话模型接管进 DSH 模型选择器：微信扫码登录 → 免登录读模型清单 → 本机反代把 OpenAI 请求译成 /cgi-bin/assistant/qa 的 SSE。必须走本机反代（上游不是 OpenAI 兼容）。",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "ima",
+    "tencent",
+    "llm",
+    "provider"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cc1104666/dsh-plugins.git",
+    "directory": "packages/dsh-ima"
+  },
+  "author": "cc1104666",
+  "homepage": "https://github.com/cc1104666/dsh-plugins/tree/main/packages/dsh-ima#readme",
+  "bugs": {
+    "url": "https://github.com/cc1104666/dsh-plugins/issues"
+  }
+}
